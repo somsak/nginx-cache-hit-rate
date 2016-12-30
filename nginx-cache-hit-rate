@@ -311,10 +311,8 @@ class LogHandler(pyinotify.ProcessEvent):
                 hit_stat[cache_status]['size'] += size
             except KeyError :
                 hit_stat[cache_status] = {'count': 1, 'size': size}
+            debug(str(hit_stat))
             hit_stat_cond.release()
-        # hit_stat_cond.acquire()
-        # debug(hit_stat)
-        # hit_stat_cond.release()
 
     # def process_default(self, event) :
     #     debug("Default:" + event.pathname + "," + event.maskname)

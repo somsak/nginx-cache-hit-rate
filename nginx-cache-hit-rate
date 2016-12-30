@@ -1,0 +1,439 @@
+#!/usr/bin/env python
+from __future__ import print_function
+
+import time
+import select
+from argparse import ArgumentParser
+import tempfile
+import os
+import shlex
+import threading
+import copy
+
+import pyinotify
+import redis
+
+debug_flag = False
+
+def debug(msg) :
+    if debug_flag :
+        sys.stderr.write(msg + '\n')
+
+# Code below taken directly from Pygtail project
+
+# pygtail - a python "port" of logtail2
+# Copyright (C) 2011 Brad Greenlee <brad@footle.org>
+#
+# Derived from logcheck <http://logcheck.org>
+# Copyright (C) 2003 Jonathan Middleton <jjm@ixtab.org.uk>
+# Copyright (C) 2001 Paul Slootman <paul@debian.org>
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
+
+from os import stat
+from os.path import exists, getsize
+import sys
+import glob
+import gzip
+
+
+PY3 = sys.version_info[0] == 3
+
+if PY3:
+    text_type = str
+else:
+    text_type = unicode
+
+
+def force_text(s, encoding='utf-8', errors='strict'):
+    if isinstance(s, text_type):
+        return s
+    return s.decode(encoding, errors)
+
+
+class Pygtail(object):
+    """
+    Creates an iterable object that returns only unread lines.
+
+    Keyword arguments:
+    offset_file   File to which offset data is written (default: <logfile>.offset).
+    paranoid      Update the offset file every time we read a line (as opposed to
+                  only when we reach the end of the file (default: False))
+    every_n       Update the offset file every n'th line (as opposed to only when
+                  we reach the end of the file (default: 0))
+    on_update     Execute this function when offset data is written (default False)
+    copytruncate  Support copytruncate-style log rotation (default: True)
+    """
+    def __init__(self, filename, offset_file=None, paranoid=False, copytruncate=True,
+                 every_n=0, on_update=False):
+        self.filename = filename
+        self.paranoid = paranoid
+        self.every_n = every_n
+        self.on_update = on_update
+        self.copytruncate = copytruncate
+        self._offset_file = offset_file or "%s.offset" % self.filename
+        self._offset_file_inode = 0
+        self._offset = 0
+        self._since_update = 0
+        self._fh = None
+        self._rotated_logfile = None
+
+        # if offset file exists and non-empty, open and parse it
+        if exists(self._offset_file) and getsize(self._offset_file):
+            offset_fh = open(self._offset_file, "r")
+            (self._offset_file_inode, self._offset) = \
+                [int(line.strip()) for line in offset_fh]
+            offset_fh.close()
+            if self._offset_file_inode != stat(self.filename).st_ino or \
+                    stat(self.filename).st_size < self._offset:
+                # The inode has changed or filesize has reduced so the file
+                # might have been rotated.
+                # Look for the rotated file and process that if we find it.
+                self._rotated_logfile = self._determine_rotated_logfile()
+
+    def __del__(self):
+        if self._filehandle():
+            self._filehandle().close()
+
+    def __iter__(self):
+        return self
+
+    def next(self):
+        """
+        Return the next line in the file, updating the offset.
+        """
+        debug('Next() is called')
+        try:
+            line = self._get_next_line()
+        except StopIteration:
+            # we've reached the end of the file; if we're processing the
+            # rotated log file, we can continue with the actual file; otherwise
+            # update the offset file
+            if self._rotated_logfile:
+                self._rotated_logfile = None
+                self._fh.close()
+                self._offset = 0
+                # open up current logfile and continue
+                try:
+                    line = self._get_next_line()
+                except StopIteration:  # oops, empty file
+                    self._update_offset_file()
+                    raise
+            else:
+                self._update_offset_file()
+                raise
+
+        if self.paranoid:
+            self._update_offset_file()
+        elif self.every_n and self.every_n <= self._since_update:
+            self._update_offset_file()
+
+        return line
+
+    def __next__(self):
+        """`__next__` is the Python 3 version of `next`"""
+        return self.next()
+
+    def readlines(self):
+        """
+        Read in all unread lines and return them as a list.
+        """
+        return [line for line in self]
+
+    def read(self):
+        """
+        Read in all unread lines and return them as a single string.
+        """
+        lines = self.readlines()
+        if lines:
+            try:
+                return ''.join(lines)
+            except TypeError:
+                return ''.join(force_text(line) for line in lines)
+        else:
+            return None
+
+    def _is_closed(self):
+        if not self._fh:
+            return True
+        try:
+            return self._fh.closed
+        except AttributeError:
+            if isinstance(self._fh, gzip.GzipFile):
+                # python 2.6
+                return self._fh.fileobj is None
+            else:
+                raise
+
+    def _filehandle(self):
+        """
+        Return a filehandle to the file being tailed, with the position set
+        to the current offset.
+        """
+        if not self._fh or self._is_closed():
+            filename = self._rotated_logfile or self.filename
+            if filename.endswith('.gz'):
+                self._fh = gzip.open(filename, 'r')
+            else:
+                self._fh = open(filename, "r", 1)
+            self._fh.seek(self._offset)
+
+        return self._fh
+
+    def _update_offset_file(self):
+        """
+        Update the offset file with the current inode and offset.
+        """
+        if self.on_update:
+            self.on_update()
+        offset = self._filehandle().tell()
+        inode = stat(self.filename).st_ino
+        fh = open(self._offset_file, "w")
+        fh.write("%s\n%s\n" % (inode, offset))
+        fh.close()
+        self._since_update = 0
+
+    def _determine_rotated_logfile(self):
+        """
+        We suspect the logfile has been rotated, so try to guess what the
+        rotated filename is, and return it.
+        """
+        rotated_filename = self._check_rotated_filename_candidates()
+        if rotated_filename and exists(rotated_filename):
+            if stat(rotated_filename).st_ino == self._offset_file_inode:
+                return rotated_filename
+
+            # if the inode hasn't changed, then the file shrank; this is expected with copytruncate,
+            # otherwise print a warning
+            if stat(self.filename).st_ino == self._offset_file_inode:
+                if self.copytruncate:
+                    return rotated_filename
+                else:
+                    sys.stderr.write(
+                        "[pygtail] [WARN] file size of %s shrank, and copytruncate support is "
+                        "disabled (expected at least %d bytes, was %d bytes).\n" %
+                        (self.filename, self._offset, stat(self.filename).st_size))
+
+        return None
+
+    def _check_rotated_filename_candidates(self):
+        """
+        Check for various rotated logfile filename patterns and return the first
+        match we find.
+        """
+        # savelog(8)
+        candidate = "%s.0" % self.filename
+        if (exists(candidate) and exists("%s.1.gz" % self.filename) and
+            (stat(candidate).st_mtime > stat("%s.1.gz" % self.filename).st_mtime)):
+            return candidate
+
+        # logrotate(8)
+        # with delaycompress
+        candidate = "%s.1" % self.filename
+        if exists(candidate):
+            return candidate
+
+        # without delaycompress
+        candidate = "%s.1.gz" % self.filename
+        if exists(candidate):
+            return candidate
+
+        rotated_filename_patterns = (
+            # logrotate dateext rotation scheme - `dateformat -%Y%m%d` + with `delaycompress`
+            "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]",
+            # logrotate dateext rotation scheme - `dateformat -%Y%m%d` + without `delaycompress`
+            "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].gz",
+            # logrotate dateext rotation scheme - `dateformat -%Y%m%d-%s` + with `delaycompress`
+            "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]",
+            # logrotate dateext rotation scheme - `dateformat -%Y%m%d-%s` + without `delaycompress`
+            "-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9].gz",
+            # for TimedRotatingFileHandler
+            ".[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]",
+        )
+        for rotated_filename_pattern in rotated_filename_patterns:
+            candidates = glob.glob(self.filename + rotated_filename_pattern)
+            if candidates:
+                candidates.sort()
+                return candidates[-1]  # return most recent
+
+        # no match
+        return None
+
+    def _get_next_line(self):
+        line = self._filehandle().readline()
+        if not line:
+            raise StopIteration
+        self._since_update += 1
+        return line
+
+hit_stat = {}
+hit_stat_cond = threading.Condition()
+exit = False
+
+class LogHandler(pyinotify.ProcessEvent):
+    def __init__(self, args, wm) :
+        self.args = args
+        self.log_file = args.logfile
+        self.tmp_offset_file = os.path.join(tempfile.gettempdir(), self.log_file.replace(os.sep, '_') + '.offset')
+        self.tailer = Pygtail(self.log_file, offset_file = self.tmp_offset_file)
+        self.wm = wm
+        self.mask = pyinotify.IN_MODIFY | pyinotify.IN_DELETE | pyinotify.IN_DELETE_SELF | pyinotify.IN_MOVE_SELF
+        #self.mask = pyinotify.ALL_EVENTS
+        # Initial log processing
+        self.process_log()
+        self.wdd = self.wm.add_watch(self.tailer.filename, self.mask, quiet = False)
+
+
+    def process_log(self) :
+        global hit_stat
+
+        for line in self.tailer :
+            fields = shlex.split(line)
+
+            cache_status = fields[self.args.cache_status_field - 1].lower()
+            size = long(fields[self.args.size_field - 1])
+
+            hit_stat_cond.acquire()
+            try :
+                hit_stat[cache_status]['count'] += 1
+                hit_stat[cache_status]['size'] += size
+            except KeyError :
+                hit_stat[cache_status] = {'count': 1, 'size': size}
+            hit_stat_cond.release()
+        # hit_stat_cond.acquire()
+        # debug(hit_stat)
+        # hit_stat_cond.release()
+
+    # def process_default(self, event) :
+    #     debug("Default:" + event.pathname + "," + event.maskname)
+
+    def process_IN_MODIFY(self, event):
+        debug("Modifying:" + event.pathname)
+        self.process_log()
+
+    def process_deletion(self, event) :
+        debug("Handle deletion " + event.pathname + " " + event.maskname)
+        if event.mask != pyinotify.IN_DELETE_SELF :
+            self.wm.rm_watch(self.wdd[self.tailer.filename])
+        max_retry = 10
+        for i in range(max_retry) :
+            if not os.access(self.tailer.filename, os.R_OK) :
+                time.sleep(1.0)
+            else :
+                break
+        os.remove(self.tmp_offset_file)
+        self.tailer = Pygtail(self.log_file, offset_file = self.tmp_offset_file)
+        self.wdd = self.wm.add_watch(self.tailer.filename, self.mask, quiet = False)
+
+    def process_IN_DELETE(self, event):
+        debug("Removing:" + event.pathname)
+        return self.process_deletion(event)
+
+    def process_IN_DELETE_SELF(self, event):
+        debug("Removing self:" + event.pathname)
+        return self.process_deletion(event)
+
+    def process_IN_MOVE_SELF(self, event) :
+        debug("Move self:" + event.pathname)
+        return self.process_deletion(event)
+
+class RedisUpdater(threading.Thread) :
+    def __init__(self, redis_host = '127.0.0.1', redis_port = 6379, redis_db = 0, hash_name = 'ngx_cache_status', key_prefix = '') :
+        threading.Thread.__init__(self)
+        self.redis_host = redis_host
+        self.redis_port = redis_port
+        self.redis_db = redis_db
+        self.hash_name = hash_name
+        self.key_prefix = key_prefix
+        self.update_interval = 5 #update interval in second
+        self._hit_stat = None
+        self.redis = redis.StrictRedis(host = self.redis_host, port = self.redis_port, db = self.redis_db)
+
+    def send_data(self) :
+        debug("Sending hitstat data to Redis")
+        if self._hit_stat :
+            debug("There's something to be sent")
+            for key, value in self._hit_stat.iteritems() :
+                if key == '-' :
+                    key = 'nocache'
+                for field in value.iterkeys() :
+                    self.redis.hincrby(self.hash_name, self.key_prefix + key + '.' + field, value[field])
+                    debug("Increase " + self.hash_name + "." + self.key_prefix + key + '.' + field + " by " + str(value[field]))
+
+    def run(self) :
+        global hit_stat
+        global hit_stat_cond
+        global exit
+
+        debug('Starting RedisUpdater run')
+        while not exit :
+            debug('Redis updater loop')
+            hit_stat_cond.acquire()
+
+            debug('Lock acquired')
+            hit_stat_cond.wait(self.update_interval)
+
+            if hit_stat :
+                self._hit_stat = copy.deepcopy(hit_stat)
+                hit_stat = {}
+
+            hit_stat_cond.release()
+            debug('Lock released')
+            self.send_data()
+            self._hit_stat = None
+
+
+def main() :
+    global debug_flag
+    global exit
+    global hit_stat_cond
+
+    parser = ArgumentParser(description = 'NGINX Hit rate to Redis logger')
+
+    parser.add_argument('-d', dest='debug_flag', action="store_true", default = False,
+        help = 'Turn on debugging')
+    parser.add_argument('-c', '--cache-status', dest="cache_status_field", default = 15, type=int,
+        help = 'Field number that contains upstream_cache_status value')
+    parser.add_argument('-s', '--size', dest="size_field", default = 7, type=int,
+        help = 'Field number that contains response size')
+    parser.add_argument('--redis-host', dest="redis_host", default = "127.0.0.1",
+        help = 'Redis host to connect to')
+    parser.add_argument('--redis-port', dest="redis_port", default = 6379, type=int,
+        help = 'Redis port to connect to')
+    parser.add_argument('--redis-db', dest="redis_db", default = 0, type=int,
+        help = 'Redis database number to use')
+    parser.add_argument('--redis-key-prefix', dest="redis_key_prefix", default = '',
+        help = 'Prefix of key to use')
+
+    parser.add_argument('logfile', help = 'Path to log file to be read')
+
+    args = parser.parse_args()
+
+    debug_flag = args.debug_flag
+    redis_updater = RedisUpdater(redis_host = args.redis_host, redis_port = args.redis_port, redis_db = args.redis_db)
+    redis_updater.start()
+    wm = pyinotify.WatchManager()
+    handler = LogHandler(args, wm)
+    notifier = pyinotify.Notifier(wm, handler)
+
+    notifier.loop()
+
+    hit_stat_cond.acquire()
+    exit = True
+    hit_stat_cond.notify()
+    hit_stat_cond.release()
+    redis_updater.join()
+
+main()

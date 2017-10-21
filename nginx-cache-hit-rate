@@ -9,15 +9,14 @@ import os
 import shlex
 import threading
 import copy
+import logging
+import types
 
 import pyinotify
 import redis
 
-debug_flag = False
-
 def debug(msg) :
-    if debug_flag :
-        sys.stderr.write(msg + '\n')
+    logging.debug(msg)
 
 # Code below taken directly from Pygtail project
 
@@ -290,28 +289,69 @@ class LogHandler(pyinotify.ProcessEvent):
         self.tailer = Pygtail(self.log_file, offset_file = self.tmp_offset_file)
         self.wm = wm
         self.mask = pyinotify.IN_MODIFY | pyinotify.IN_DELETE | pyinotify.IN_DELETE_SELF | pyinotify.IN_MOVE_SELF
+        self.success = 0
+        self.fail = 0
+
         #self.mask = pyinotify.ALL_EVENTS
         # Initial log processing
         self.process_log()
         self.wdd = self.wm.add_watch(self.tailer.filename, self.mask, quiet = False)
 
-
     def process_log(self) :
         global hit_stat
 
         for line in self.tailer :
-            fields = shlex.split(line)
+            try :
+                fields = shlex.split(line)
+            except ValueError :
+                debug("Got strange line: %s" % (line))
+                self.fail += 1
+                continue
+            try :
+                cache_status = fields[self.args.cache_status_field - 1].lower()
+                size = long(fields[self.args.size_field - 1])
+            except IndexError :
+                debug("Got invalid line: %s" % (line))
+                self.fail += 1
+                continue
 
-            cache_status = fields[self.args.cache_status_field - 1].lower()
-            size = long(fields[self.args.size_field - 1])
+            # Check according to supplied arg
+            status = int(fields[self.args.http_status_field - 1])
+            try :
+                if self.args.accept_method :
+                    method = fields[self.args.http_request_field - 1].split(None, 1)[0]
+                    if not method in self.args.accept_method :
+                        debug("Skipping %s due to accept method %s" % (method, self.args.accept_method))
+                        continue
+                if self.args.accept_status_less_than :
+                    if status > self.args.accept_status_less_than :
+                        debug("Skipping status %d due to accept-status-less-than %d" % (status, self.args.accept_status_less_than))
+                        continue
+            except IndexError, TypeError :
+                debug("Got invalid line: %s" % (line))
+                self.fail += 1
+                continue
 
             hit_stat_cond.acquire()
             try :
                 hit_stat[cache_status]['count'] += 1
                 hit_stat[cache_status]['size'] += size
+                if self.args.http_status_stat :
+                    try :
+                        hit_stat['http_' + str(status)] += 1
+                    except KeyError :
+                        hit_stat['http_' + str(status)] = 1
+                    if self.args.http_status_group :
+                        status_group = status / 100 
+                        try :
+                            hit_stat['http_' + str(status_group) + 'xx'] += 1
+                        except KeyError :
+                            hit_stat['http_' + str(status_group) + 'xx'] = 1
             except KeyError :
                 hit_stat[cache_status] = {'count': 1, 'size': size}
+            self.success += 1
             debug(str(hit_stat))
+            debug('success = %d, fail = %d' % (self.success, self.fail))
             hit_stat_cond.release()
 
     # def process_default(self, event) :
@@ -366,9 +406,13 @@ class RedisUpdater(threading.Thread) :
             for key, value in self._hit_stat.iteritems() :
                 if key == '-' :
                     key = 'nocache'
-                for field in value.iterkeys() :
-                    self.redis.hincrby(self.hash_name, self.key_prefix + key + '.' + field, value[field])
-                    debug("Increase " + self.hash_name + "." + self.key_prefix + key + '.' + field + " by " + str(value[field]))
+                if type(value) == types.DictType :
+                    for field in value.iterkeys() :
+                        self.redis.hincrby(self.hash_name, self.key_prefix + key + '.' + field, value[field])
+                        debug("Increase " + self.hash_name + "." + self.key_prefix + key + '.' + field + " by " + str(value[field]))
+                else :
+                    self.redis.hincrby(self.hash_name, self.key_prefix + key, value)
+                    debug("Increase " + self.hash_name + "." + self.key_prefix + key + " by " + str(value))
 
     def run(self) :
         global hit_stat
@@ -394,18 +438,29 @@ class RedisUpdater(threading.Thread) :
 
 
 def main() :
-    global debug_flag
     global exit
     global hit_stat_cond
 
     parser = ArgumentParser(description = 'NGINX Hit rate to Redis logger')
 
-    parser.add_argument('-d', dest='debug_flag', action="store_true", default = False,
-        help = 'Turn on debugging')
-    parser.add_argument('-c', '--cache-status', dest="cache_status_field", default = 15, type=int,
+    parser.add_argument('--log-level', dest='log_level', default = 'ERROR',
+        help = 'Specify log level')
+    parser.add_argument('-l', '--log-file', dest='log_file', default = None,
+        help = 'Specify log file')
+
+    parser.add_argument('-c', '--cache-status', dest="cache_status_field", default = 14, type=int,
         help = 'Field number that contains upstream_cache_status value')
     parser.add_argument('-s', '--size', dest="size_field", default = 7, type=int,
         help = 'Field number that contains response size')
+    parser.add_argument('-r', '--http-request', dest="http_request_field", default = 5, type=int,
+        help = 'Field number that contains HTTP Request (GET /a/b/c/d/e) field')
+    parser.add_argument('-S', '--http-status', dest="http_status_field", default = 6, type=int,
+        help = 'Field number that contains HTTP Status field')
+    parser.add_argument('--http-status-stat', dest="http_status_stat", action='store_true', default = False,
+        help = 'Also collect number of HTTP status (200, 206, 400, 502, etc..)')
+    parser.add_argument('--http-status-stat-group', dest="http_status_group", action='store_true', default = False,
+        help = 'Status stat will also collect grouping of each status (2xx, 4xx, 5xx)')
+
     parser.add_argument('--redis-host', dest="redis_host", default = "127.0.0.1",
         help = 'Redis host to connect to')
     parser.add_argument('--redis-port', dest="redis_port", default = 6379, type=int,
@@ -415,11 +470,25 @@ def main() :
     parser.add_argument('--redis-key-prefix', dest="redis_key_prefix", default = '',
         help = 'Prefix of key to use')
 
+    parser.add_argument('-a', '--accept-method', dest="accept_method", default = None, action='append',
+        choices = ["GET", "HEAD", "POST", "PUT", "DELETE", "TRACE", "CONNECT"],
+        help = "Limit HTTP Method that will be checked (default: all method are accounted for). Could be specified multiple time")
+    parser.add_argument('-e', '--accept-status-less-than', dest="accept_status_less_than", default = None, type=int,
+        help = "Limit HTTP status that will be checked, must less than specified status number")
+
     parser.add_argument('logfile', help = 'Path to log file to be read')
 
     args = parser.parse_args()
 
-    debug_flag = args.debug_flag
+    numeric_level = getattr(logging, args.log_level.upper(), None)
+    if not isinstance(numeric_level, int):
+        parser.error('Invalid log level: %s' % (args.log_level))
+
+    if args.log_file :
+        logging.basicConfig(level = numeric_level,filename = args.log_file, format='%(asctime)s %(message)s')
+    else :
+        logging.basicConfig(level = numeric_level, format='%(asctime)s %(message)s')
+
     redis_updater = RedisUpdater(redis_host = args.redis_host, redis_port = args.redis_port, redis_db = args.redis_db)
     redis_updater.start()
     wm = pyinotify.WatchManager()
